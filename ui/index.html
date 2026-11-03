@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TalkFlow 英语对话记单词 - 移动端原型</title>
+<style>
+:root{
+  --primary:#4F46E5;--primary-light:#818CF8;--accent:#16A34A;
+  --bg:#EEF2FF;--card:#FFFFFF;--text:#312E81;--muted:#475569;
+  --border:#C7D2FE;--danger:#DC2626;--radius:20px;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'PingFang SC','Microsoft YaHei',sans-serif;background:#1a1a2e;display:flex;flex-direction:column;align-items:center;min-height:100vh;padding:20px}
+.prototype-title{color:#fff;font-size:24px;margin-bottom:20px;text-align:center}
+.prototype-title small{display:block;font-size:14px;color:#818CF8;margin-top:8px}
+.phone-frame{width:390px;height:844px;background:var(--bg);border-radius:40px;border:8px solid #2d2d44;overflow:hidden;position:relative;box-shadow:0 25px 80px rgba(0,0,0,.5)}
+.status-bar{height:44px;display:flex;justify-content:space-between;align-items:center;padding:0 24px;font-size:14px;font-weight:600;color:var(--text)}
+.screen{position:absolute;inset:44px 0 0 0;display:none;flex-direction:column;overflow-y:auto;overflow-x:hidden;padding-bottom:0}
+.screen.active{display:flex}
+.screen.has-tabbar{padding-bottom:80px}
+.btn{border:none;border-radius:16px;padding:14px 24px;font-size:16px;font-weight:600;cursor:pointer;transition:all .2s}
+.btn:active{transform:scale(.97)}
+.btn-primary{background:var(--primary);color:#fff;box-shadow:0 4px 15px rgba(79,70,229,.3)}
+.btn-secondary{background:var(--card);color:var(--primary);border:2px solid var(--border)}
+.btn-danger{background:var(--danger);color:#fff}
+.card{background:var(--card);border-radius:var(--radius);padding:20px;box-shadow:0 4px 20px rgba(79,70,229,.08);margin:12px 16px}
+.nav-back{padding:12px 16px;display:flex;align-items:center;gap:8px;color:var(--primary);font-weight:600;cursor:pointer;font-size:16px}
+.tab-bar{position:fixed;bottom:0;left:0;right:0;height:80px;background:var(--card);border-top:2px solid var(--border);display:flex;justify-content:space-around;align-items:center;padding-bottom:12px;z-index:100}
+.tab-item{display:flex;flex-direction:column;align-items:center;gap:4px;font-size:12px;color:var(--muted);cursor:pointer;padding:8px 12px;min-width:60px}
+.tab-item.active{color:var(--primary)}
+.tab-item svg{width:24px;height:24px}
+h1{font-size:26px;font-weight:700;color:var(--text)}
+h2{font-size:20px;font-weight:600;color:var(--text);margin-bottom:12px}
+p{color:var(--muted);line-height:1.6}
+.input{width:100%;padding:14px 16px;border:2px solid var(--border);border-radius:14px;font-size:16px;margin-bottom:12px;background:var(--card)}
+.badge{display:inline-block;padding:4px 12px;border-radius:20px;font-size:12px;font-weight:600}
+.badge-primary{background:#EEF2FF;color:var(--primary)}
+.badge-green{background:#ECFDF5;color:var(--accent)}
+.badge-orange{background:#FFF7ED;color:#EA580C}
+</style>
+</head>
+<body>
+<div class="prototype-title">
+  TalkFlow 英语对话记单词
+  <small>移动端交互原型 · 点击页面元素可切换</small>
+</div>
+<div class="phone-frame">
+  <div class="status-bar"><span>9:41</span><span>📶 🔋</span></div>
+  <div id="screens"></div>
+</div>
+<script src="app.js"></script>
+</body>
+</html>
