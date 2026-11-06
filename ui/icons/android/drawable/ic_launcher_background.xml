@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 自适应图标背景层：暖橙对角渐变 + 左上高光 ｜ 由 ui/icons/generate_icons.py 生成，请勿手改 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp" android:height="108dp"
+    android:viewportWidth="512" android:viewportHeight="512">
+    <path android:pathData="M 0 0 L 512 0 L 512 512 L 0 512 Z">
+            <aapt:attr name="android:fillColor">
+                <gradient android:type="linear" android:startX="0" android:startY="0" android:endX="512" android:endY="512">
+                <item android:offset="0" android:color="#FFFFAE72"/>
+                <item android:offset="0.45" android:color="#FFFF7A50"/>
+                <item android:offset="1" android:color="#FFE5432A"/>
+                </gradient>
+            </aapt:attr>
+    </path>
+    <path android:pathData="M 0 0 L 512 0 L 512 512 L 0 512 Z">
+            <aapt:attr name="android:fillColor">
+                <gradient android:type="radial" android:centerX="123" android:centerY="72" android:gradientRadius="410">
+                <item android:offset="0" android:color="#4CFFFFFF"/>
+                <item android:offset="1" android:color="#00FFFFFF"/>
+                </gradient>
+            </aapt:attr>
+    </path>
+</vector>
