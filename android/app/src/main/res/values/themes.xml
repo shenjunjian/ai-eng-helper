@@ -1,5 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
 
-    <style name="Theme.LangHelper" parent="android:Theme.Material.Light.NoActionBar" />
+    <!--
+      启动主题：米白 windowBackground 避免冷启动闪白，
+      状态栏/导航栏透明由 Compose 侧 edgeToEdge + TalkFlowTheme 接管。
+    -->
+    <style name="Theme.TalkFlow" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@color/app_bg</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowLightNavigationBar">true</item>
+    </style>
 </resources>

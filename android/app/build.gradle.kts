@@ -83,6 +83,9 @@ dependencies {
     implementation(libs.androidx.navigation.compose)
     implementation(libs.kotlinx.coroutines.android)
 
+    // 底部页签的毛玻璃背景模糊（对应原型 backdrop-filter: blur(20px)）
+    implementation(libs.haze)
+
     // 本地数据库
     implementation(libs.androidx.room.runtime)
     implementation(libs.androidx.room.ktx)

@@ -289,6 +289,13 @@ class AppRepository(
             if (id == null) kotlinx.coroutines.flow.flowOf(0) else sessionDao.observeSessionCount(id)
         }
 
+    /** 全部会话的累计对话时长（秒），「我的」页展示用 */
+    fun observeTotalDurationSeconds(): Flow<Int> =
+        observeCurrentUserId().flatMapLatest { id ->
+            if (id == null) kotlinx.coroutines.flow.flowOf(0)
+            else sessionDao.observeTotalDurationSeconds(id)
+        }
+
     // ---------- 消息（字幕） ----------
 
     fun observeMessages(sessionId: String): Flow<List<MessageEntity>> =
@@ -344,6 +351,9 @@ class AppRepository(
         observeCurrentUserId().flatMapLatest { id ->
             if (id == null) kotlinx.coroutines.flow.flowOf(0) else wordDao.observePendingCount(id)
         }
+
+    /** 按主键取词条（通话页复习模式用） */
+    suspend fun wordById(id: Long): WordEntity? = wordDao.findById(id)
 
     suspend fun existingTerms(): List<String> =
         userDao.currentUser()?.let { wordDao.existingTerms(it.id) } ?: emptyList()
