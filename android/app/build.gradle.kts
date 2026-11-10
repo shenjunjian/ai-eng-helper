@@ -1,7 +1,19 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
+    alias(libs.plugins.ksp)
 }
+
+// 本地私密配置（AOQ 凭证等），不进入版本库
+val localProps = Properties().apply {
+    val f = rootProject.file("local.properties")
+    if (f.exists()) f.inputStream().use { load(it) }
+}
+
+fun localProp(key: String, default: String = ""): String =
+    localProps.getProperty(key) ?: default
 
 android {
     namespace = "com.shenjj.edu"
@@ -17,6 +29,16 @@ android {
         versionName = "1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        // AOQ SDK 仅提供这两个 ABI 的 .so
+        ndk {
+            abiFilters += listOf("armeabi-v7a", "arm64-v8a")
+        }
+
+        buildConfigField("String", "AOQ_API_KEY", "\"${localProp("AOQ_API_KEY")}\"")
+        buildConfigField("String", "AOQ_WORKSPACE_ID", "\"${localProp("AOQ_WORKSPACE_ID")}\"")
+        buildConfigField("String", "AOQ_REGION", "\"${localProp("AOQ_REGION", "cn-beijing")}\"")
+        buildConfigField("String", "AOQ_MODEL", "\"${localProp("AOQ_MODEL", "qwen-audio-3.1-realtime-flash")}\"")
     }
 
     buildTypes {
@@ -33,18 +55,44 @@ android {
     }
     buildFeatures {
         compose = true
+        buildConfig = true
     }
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
+    }
+}
+
+ksp {
+    arg("room.schemaLocation", "$projectDir/schemas")
 }
 
 dependencies {
     implementation(platform(libs.androidx.compose.bom))
     implementation(libs.androidx.activity.compose)
     implementation(libs.androidx.compose.material3)
+    implementation(libs.androidx.compose.material.icons.extended)
     implementation(libs.androidx.compose.ui)
     implementation(libs.androidx.compose.ui.graphics)
     implementation(libs.androidx.compose.ui.tooling.preview)
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
+    implementation(libs.androidx.lifecycle.runtime.compose)
+    implementation(libs.androidx.lifecycle.viewmodel.compose)
+    implementation(libs.androidx.navigation.compose)
+    implementation(libs.kotlinx.coroutines.android)
+
+    // 本地数据库
+    implementation(libs.androidx.room.runtime)
+    implementation(libs.androidx.room.ktx)
+    ksp(libs.androidx.room.compiler)
+
+    // AOQ 实时语音 SDK（aar 复用仓库根 libs/ 下已入库的那一份，不再复制副本）
+    // 相对路径以模块目录 android/app 为基准，故需回退两级
+    implementation(libs.okhttp)
+    implementation(files("${projectDir}/../../libs/AOQ SDK/AoqClientSdk-release.aar"))
+
     testImplementation(libs.junit)
     androidTestImplementation(platform(libs.androidx.compose.bom))
     androidTestImplementation(libs.androidx.compose.ui.test.junit4)

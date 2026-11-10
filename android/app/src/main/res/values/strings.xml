@@ -1,3 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">LangHelper</string>
+    <string name="app_name">TalkFlow</string>
+    <string name="call_channel_name">实时语音对话</string>
+    <string name="call_channel_running">对话进行中…</string>
 </resources>
