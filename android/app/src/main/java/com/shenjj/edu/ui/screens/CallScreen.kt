@@ -260,7 +260,13 @@ private fun CallHeader(
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
             Text(
-                text = "${state.teacher.name} · ${if (state.reviewMode) "复习模式" else "对话中"}",
+                // 只有真的进入 Ready 才说"对话中"：Connecting 时显示"对话中"会让人以为链路已通
+                text = "${state.teacher.name} · ${when (state.phase) {
+                    CallPhase.Ready -> if (state.reviewMode) "复习模式" else "对话中"
+                    CallPhase.Connecting -> "接通中"
+                    CallPhase.Failed -> "已断开"
+                    CallPhase.Idle -> "准备中"
+                }}",
                 style = MaterialTheme.typography.titleSmall.copy(
                     fontSize = 16.sp,
                     fontWeight = FontWeight.Bold,

@@ -1,8 +1,10 @@
 package com.shenjj.edu.voice
 
 import android.content.Context
+import android.util.Log
 import com.alibaba.aoq.clientsdk.AoqClientEngine
 import com.alibaba.aoq.clientsdk.AoqClientListener
+import com.shenjj.edu.BuildConfig
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
@@ -81,8 +83,54 @@ class AoqVoiceEngine(private val context: Context) {
             handleData(msg.data)
         }
 
+        override fun onWarning(code: Int, msg: String?) {
+            Log.w(TAG, "AOQ warning $code：$msg")
+        }
+
         override fun onError(code: Int, msg: String?) {
+            Log.e(TAG, "AOQ error $code：$msg")
             emit(AoqEvent.Failure("AOQ 错误 $code：$msg"))
+        }
+
+        /**
+         * 下行有没有音频只看这一个数字：audioSubscribeStats.bytes 不涨 = 服务端没发，
+         * 涨了却没声音 = 本机播放/路由问题。没有它，「没声音」永远只能靠猜。
+         */
+        override fun onStats(stats: AoqClientEngine.AoqStats) {
+            val pub = stats.audioPublishStats?.firstOrNull()
+            val sub = stats.audioSubscribeStats?.firstOrNull()
+            val dataSub = stats.dataMsgSubscribeStats?.firstOrNull()
+            val net = stats.networkStats
+            Log.i(
+                TAG,
+                "stats ↑pub=${pub?.bytes ?: -1}B/${pub?.bitrate ?: -1}kbps encVol=${pub?.encodeVolume ?: -1} " +
+                    "↓sub=${sub?.bytes ?: -1}B/${sub?.bitrate ?: -1}kbps playVol=${sub?.playVolume ?: -1} " +
+                    "data=${dataSub?.bytes ?: -1}B net recv=${net?.recvBytes ?: -1} send=${net?.sendBytes ?: -1} " +
+                    "loss=${net?.loss ?: -1} rtt=${net?.rtt ?: -1}",
+            )
+        }
+
+        /** 采集/播放设备起停失败会走这里（RecordFail / PlayFail），是无声问题的直接证据 */
+        override fun onAudioDeviceStateChanged(state: AoqClientEngine.AoqAudioDeviceState) {
+            Log.i(TAG, "audio device state=${state.state} reason=${state.reason}")
+            when (state.state) {
+                AoqClientEngine.AoqAudioDeviceStateCode.AoqAudioDeviceRecordFail ->
+                    emit(AoqEvent.Failure("麦克风启动失败，请检查录音权限或其他应用占用"))
+
+                AoqClientEngine.AoqAudioDeviceStateCode.AoqAudioDevicePlayFail ->
+                    emit(AoqEvent.Failure("音频播放设备启动失败"))
+
+                else -> Unit
+            }
+        }
+
+        override fun onAudioDeviceRouteChanged(routeType: Int) {
+            Log.i(TAG, "audio route=$routeType (${AoqClientEngine.AoqAudioDeviceRouteType.fromValue(routeType)})")
+        }
+
+        /** 通话被系统/其他应用打断（如来电）：不然后台恢复后表现为一直静音 */
+        override fun onAudioDeviceInterrupted(interrupt: Boolean) {
+            Log.i(TAG, "audio interrupted=$interrupt")
         }
     }
 
@@ -110,9 +158,9 @@ class AoqVoiceEngine(private val context: Context) {
             return
         }
 
-        // 上下行都用 Opus + 16k（Stream 模式的硬约束，见 SAMPLE_RATE 说明）
-        eng.setAudioEncoderConfig(opusCodec(SAMPLE_RATE))
-        eng.setAudioDecoderConfig(opusCodec(SAMPLE_RATE))
+        // 上下行传输都用 Opus + 16k（Stream 模式的要求，见 SAMPLE_RATE 说明）
+        logRet("setAudioEncoderConfig", eng.setAudioEncoderConfig(opusCodec(SAMPLE_RATE)))
+        logRet("setAudioDecoderConfig", eng.setAudioDecoderConfig(opusCodec(SAMPLE_RATE)))
 
         // 先起播放设备，保证下行音频一到就能出声
         val playback = AoqClientEngine.AoqAudioPlaybackConfig().apply {
@@ -121,7 +169,7 @@ class AoqVoiceEngine(private val context: Context) {
             isExternal = false
             channel = 1
         }
-        eng.startAudioPlayer(playback)
+        logRet("startAudioPlayer", eng.startAudioPlayer(playback))
 
         // 上行保持关闭，等 session.updated 再开（避免握手前推流）
         eng.enableSendMediaStream(AoqClientEngine.AoqTrackType.AoqTrackTypeAudio, false)
@@ -160,6 +208,24 @@ class AoqVoiceEngine(private val context: Context) {
         engine = null
     }
 
+    /**
+     * 发送 session.update。字段必须严格遵循 Qwen-Audio-Realtime 的客户端事件协议
+     * （https://help.aliyun.com/zh/model-studio/fun-audiochat-client-events），
+     * **不要照 OpenAI Realtime 的写法套**，两者字段名与取值并不相同：
+     *
+     * - `input_audio_format` 只支持 `"pcm"`（16kHz 16bit 单声道）；OpenAI 那套 `"pcm16"` 在这里是非法值。
+     * - `output_audio_format` 只支持 `"pcm"`（24kHz 16bit 单声道）。
+     *   这两个字段描述的是**网关与模型之间**的音频，与 AOQ 传输层用 Opus 无关，
+     *   文档明确「网关会将音频转换为模型所需的格式」，所以 [SAMPLE_RATE] 仍按 SDK 要求写 16000。
+     * - `input_audio_transcription` 只有 `language` 一个字段，**没有 `model`**：
+     *   转写模型（`fun-asr`）由服务端在 session.created 里下发，客户端设它只会报 invalid_value。
+     *   这里整体不传，用服务端默认配置。
+     * - `voice`：3.1 Plus/Flash 默认 `longanqian_v3.1`，`longanqian` 只属于 3.0 系列，
+     *   且「仅可在第一次 session.update 中设置」。
+     *
+     * `turn_detection` 与 `input_audio_format` 一样，只在首次发送音频前（IDLE 态）允许改，
+     * 因此必须在 enableSendMediaStream 之前发出去。
+     */
     private fun sendSessionUpdate() {
         if (sessionUpdateSent) return
         sessionUpdateSent = true
@@ -167,13 +233,19 @@ class AoqVoiceEngine(private val context: Context) {
             put("modalities", JSONArray().put("text").put("audio"))
             put("voice", pendingVoice)
             put("instructions", pendingInstructions)
-            // AOQ 传输层用 Opus，模型侧仍按 pcm16 交换，SDK 负责编解码
-            put("input_audio_format", "pcm16")
-            put("output_audio_format", "pcm16")
-            put("input_audio_transcription", JSONObject().put("model", "gpt-4o-transcribe"))
-            put("turn_detection", JSONObject().put("type", "server_vad"))
+            put("input_audio_format", "pcm")
+            put("output_audio_format", "pcm")
+            put(
+                "turn_detection",
+                JSONObject()
+                    .put("type", "server_vad")
+                    .put("threshold", VAD_THRESHOLD)
+                    .put("silence_duration_ms", VAD_SILENCE_MS),
+            )
         }
-        sendRaw(JSONObject().put("type", "session.update").put("session", session).toString())
+        val json = JSONObject().put("type", "session.update").put("session", session).toString()
+        Log.i(TAG, "session.update → voice=$pendingVoice model=${BuildConfig.AOQ_MODEL}")
+        sendRaw(json)
     }
 
     private fun handleData(bytes: ByteArray?) {
@@ -183,25 +255,35 @@ class AoqVoiceEngine(private val context: Context) {
         } catch (e: Exception) {
             return
         }
-        when (obj.optString("type")) {
+        val type = obj.optString("type")
+        when (type) {
             "session.updated" -> {
                 val eng = engine ?: return
-                // 握手完成：开上行 + 起麦克风采集
-                eng.enableSendMediaStream(AoqClientEngine.AoqTrackType.AoqTrackTypeAudio, true)
+                // 握手完成：开上行 + 起麦克风采集（VAD 需要持续上行才有轮次）
+                logRet("enableSendMediaStream(audio)", eng.enableSendMediaStream(
+                    AoqClientEngine.AoqTrackType.AoqTrackTypeAudio, true,
+                ))
                 val capture = AoqClientEngine.AoqAudioCaptureConfig().apply {
                     isExternal = false
                     isVoipMode = true
                     channel = 1
                 }
-                eng.startAudioCapture(capture)
+                logRet("startAudioCapture", eng.startAudioCapture(capture))
                 emit(AoqEvent.SessionReady)
             }
 
-            "conversation.item.input_audio_transcription.delta" ->
-                emit(AoqEvent.UserTranscript(obj.optString("delta"), false))
+            // ASR 中间结果：本协议里增量字段叫 text（已确定）+ stash（未确定），不是 OpenAI 的 delta
+            "conversation.item.input_audio_transcription.delta" -> {
+                val partial = obj.optString("text") + obj.optString("stash")
+                if (partial.isNotEmpty()) emit(AoqEvent.UserTranscript(partial, false))
+            }
 
             "conversation.item.input_audio_transcription.completed" ->
                 emit(AoqEvent.UserTranscript(obj.optString("transcript"), true))
+
+            // 转写失败只影响用户这侧的字幕，AI 语音不受影响：记日志，不打断通话
+            "conversation.item.input_audio_transcription.failed" ->
+                Log.w(TAG, "ASR 转写失败：${obj.optJSONObject("error")?.optString("message")}")
 
             "response.audio_transcript.delta" ->
                 emit(AoqEvent.AiDelta(obj.optString("delta")))
@@ -209,12 +291,26 @@ class AoqVoiceEngine(private val context: Context) {
             "response.audio_transcript.done" ->
                 emit(AoqEvent.AiDone(obj.optString("transcript")))
 
+            // VAD 只报事件、不触发推理 = 模型认为这不是有效轮次，是"没声音"最常见的形态
+            "input_audio_buffer.speech_started" -> Log.i(TAG, "VAD 检测到语音开始")
+            "input_audio_buffer.speech_stopped" ->
+                Log.i(TAG, "VAD 检测到语音结束 reason=${obj.optString("reason")}")
+
+            "response.created" -> Log.i(TAG, "模型开始生成响应")
+
             "response.done" -> emit(AoqEvent.ResponseDone)
 
             "error" -> {
-                val reason = obj.optJSONObject("error")?.optString("message") ?: "模型返回错误"
-                emit(AoqEvent.Failure(reason))
+                val err = obj.optJSONObject("error")
+                // 客户端错误（invalid_request_error）不中断连接，只吞掉本轮，所以必须显式暴露出来
+                Log.e(TAG, "模型错误 type=${err?.optString("type")} " +
+                    "code=${err?.optString("code")} param=${err?.optString("param")} " +
+                    "message=${err?.optString("message")}")
+                emit(AoqEvent.Failure(err?.optString("message").takeUnless { it.isNullOrEmpty() } ?: "模型返回错误"))
             }
+
+            // 未识别的事件一律打出来：事件名与 OpenAI 有差异时，静默丢弃会表现成"一切正常但界面空白"
+            else -> Log.i(TAG, "未处理的事件 $type")
         }
     }
 
@@ -241,26 +337,48 @@ class AoqVoiceEngine(private val context: Context) {
         _events.tryEmit(event)
     }
 
+    /** SDK 的 int 返回值：非 0 即失败。吞掉返回值会让"没声音"变成无解的谜题。 */
+    private fun logRet(api: String, ret: Int) {
+        if (ret != 0) Log.e(TAG, "$api 失败 ret=$ret") else Log.i(TAG, "$api ok")
+    }
+
     companion object {
-        /** qwen-audio-realtime 默认音色之一；可在个人设置/通话页切换 */
-        const val DEFAULT_VOICE = "longanqian"
+        private const val TAG = "AoqVoice"
+
         /**
-         * 音频采样率：上行采集与下行播放都用 16000，Qwen-Audio-Realtime 的要求。
+         * TTS 音色。据客户端事件文档：3.1 Plus/Flash 默认 `longanqian_v3.1`，
+         * `longanqian` 只属于 3.0 Plus/Flash；且音色「仅可在第一次 session.update 中设置」，
+         * 后续传入将被忽略。切换老师/音色的持久化入口见个人设置。
+         */
+        const val DEFAULT_VOICE = "longanqian_v3.1"
+
+        /**
+         * server_vad 灵敏度与句尾静音判定时长。文档默认 0.5 / 800ms，
+         * 对话场景推荐 silence 400-800；threshold 越低越容易把背景噪音当语音。
+         */
+        private const val VAD_THRESHOLD = 0.5
+        private const val VAD_SILENCE_MS = 800
+
+        /**
+         * 音频**传输层**采样率：上下行都用 16000。
          *
-         * **不要改成 24000。** AOQ 的 Stream 模式（实时对话必须用它，低延迟连续推流）
-         * 只接受 16000；下行 decoder 一旦设成 24000，`connect` 会直接失败：
+         * 这是 AOQ Stream 模式对传输编码的要求，与模型侧采样率无关。文档写明
+         * 「这些参数用于网络传输，网关会将音频转换为模型所需的格式」，
+         * 「传输编码配置与模型事件中的音频格式参数应分别按 SDK 和目标模型的要求设置」：
+         * 模型侧固定 input 16k / output 24k，由 session.update 里的
+         * `input_audio_format` / `output_audio_format`（两者都只支持 `"pcm"`）描述，
+         * 不需要、也不能靠改这个数字来对齐。
          *
+         * 实测：decoder 设成 24000 时 `connect` 直接失败——
          * ```
          * Connect param invalid: subscribe audio sampleRate 24000 is not supported
          * in Stream mode; use Segment mode or change decoder sampleRate
          * ```
+         * 真要原样播放 24kHz，得把音频轨 [AoqClientEngine.AoqTrackMode] 换成 Segment
+         * （分段传输、延迟更高，不适合边说边听），而不是只改这里。
          *
-         * 如果将来模型确实输出 24kHz 音频、必须原样播放，那就要把音频轨的
-         * [AoqClientEngine.AoqTrackMode] 从 Stream 换成 Segment（分段传输，延迟更高、
-         * 不适合边说边听），而不是只改采样率。
-         *
-         * 注：`AoqAudioCaptureConfig` 没有 sampleRate 字段，麦克风采集的采样率
-         * 完全由这里传给 `setAudioEncoderConfig` 的 [AoqClientEngine.AoqAudioCodecConfig] 决定。
+         * 注：`AoqAudioCaptureConfig` 没有 sampleRate 字段，麦克风采集采样率
+         * 由传给 `setAudioEncoderConfig` 的 [AoqClientEngine.AoqAudioCodecConfig] 决定。
          */
         private const val SAMPLE_RATE = 16000
 
