@@ -10,6 +10,7 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.concurrent.ConcurrentHashMap
 
 /** 引擎向 UI 抛出的事件（字幕、状态、错误）。 */
 sealed interface AoqEvent {
@@ -58,8 +59,25 @@ class AoqVoiceEngine(private val context: Context) {
     private var pendingInstructions = ""
     private var pendingVoice = DEFAULT_VOICE
 
+    /** 每个 stage 独立限流，避免一个 stage 的日志挤掉其他 stage 的对照数据。 */
+    private val frameLogMs = ConcurrentHashMap<String, Long>()
+
     private val _events = MutableSharedFlow<AoqEvent>(extraBufferCapacity = 128)
     val events: SharedFlow<AoqEvent> = _events.asSharedFlow()
+
+    /** 采集链路各点的 PCM 峰值探针，见 [logFrame]。 */
+    private val frameListener = object : AoqClientListener.AoqAudioFrameListener {
+        override fun onCapturedAudioFrame(frame: AoqClientEngine.AoqAudioFrameData) = logFrame("captured", frame)
+
+        override fun onProcessCapturedAudioFrame(frame: AoqClientEngine.AoqAudioFrameData) = logFrame("3A", frame)
+
+        override fun onPublishAudioFrame(
+            trackType: AoqClientEngine.AoqTrackType,
+            frame: AoqClientEngine.AoqAudioFrameData,
+        ) = logFrame("publish", frame)
+
+        override fun onPlaybackAudioFrame(frame: AoqClientEngine.AoqAudioFrameData) = logFrame("playback", frame)
+    }
 
     private val listener = object : AoqClientListener() {
         override fun onConnectionStatusChange(status: AoqClientEngine.AoqConnectionStatus) {
@@ -95,6 +113,8 @@ class AoqVoiceEngine(private val context: Context) {
         /**
          * 下行有没有音频只看这一个数字：audioSubscribeStats.bytes 不涨 = 服务端没发，
          * 涨了却没声音 = 本机播放/路由问题。没有它，「没声音」永远只能靠猜。
+         *
+         * bitrate 的单位是 bps（实测稳态 32000，正是我们设的 [OPUS_BITRATE]），别当成 kbps。
          */
         override fun onStats(stats: AoqClientEngine.AoqStats) {
             val pub = stats.audioPublishStats?.firstOrNull()
@@ -264,6 +284,8 @@ class AoqVoiceEngine(private val context: Context) {
 
             "session.updated" -> {
                 val eng = engine ?: return
+                // 回显服务端**最终生效**的配置：voice / format / turn_detection 若与提交值不符即被忽略或拒绝
+                Log.i(TAG, "session.updated session=${obj.optJSONObject("session")}")
                 // 握手完成：开上行 + 起麦克风采集（VAD 需要持续上行才有轮次）
                 logRet("enableSendMediaStream(audio)", eng.enableSendMediaStream(
                     AoqClientEngine.AoqTrackType.AoqTrackTypeAudio, true,
@@ -274,6 +296,8 @@ class AoqVoiceEngine(private val context: Context) {
                     channel = 1
                 }
                 logRet("startAudioCapture", eng.startAudioCapture(capture))
+                // 采集起来后再接探针，否则拿不到任何帧
+                enableMicProbe(eng)
                 emit(AoqEvent.SessionReady)
             }
 
@@ -316,6 +340,43 @@ class AoqVoiceEngine(private val context: Context) {
 
             // 未识别的事件一律打出来：事件名与 OpenAI 有差异时，静默丢弃会表现成"一切正常但界面空白"
             else -> Log.i(TAG, "未处理的事件 $type")
+        }
+    }
+
+    private fun logFrame(stage: String, frame: AoqClientEngine.AoqAudioFrameData) {
+        // dataPtr 是平台类型：声明为非空 ByteArray，靠 elvis 提前返回保证安全
+        val pcm: ByteArray = frame.dataPtr ?: return
+        val bytes = minOf(frame.dataSize, pcm.size)
+        var peak = 0
+        var i = 0
+        while (i + 1 < bytes) {
+            val sample = ((pcm[i + 1].toInt() shl 8) or (pcm[i].toInt() and 0xFF)).toShort()
+            val abs = if (sample < 0) -sample.toInt() else sample.toInt()
+            if (abs > peak) peak = abs
+            i += 2
+        }
+        // 逐 stage 限流：共用一个时间戳会让后面的 stage 全被第一个吞掉，就失去对照意义了
+        val now = System.currentTimeMillis()
+        val last = frameLogMs[stage] ?: 0L
+        if (now - last < 1000) return
+        frameLogMs[stage] = now
+        Log.i(TAG, "mic[$stage] sr=${frame.samplesPerSec} ch=${frame.numOfChannels} bytes=$bytes peak=$peak")
+    }
+
+    /**
+     * 打开采集/播放链路各点的 PCM 探针（ReadOnly，不改动音频），**仅 debug 构建**。
+     * `enableAudioFrameObserver` 一次只接受一个数据源，所以逐点开启。
+     */
+    private fun enableMicProbe(eng: AoqClientEngine) {
+        if (!BuildConfig.DEBUG) return
+        logRet("setAudioFrameObserver", eng.setAudioFrameObserver(frameListener))
+        val config = AoqClientEngine.AoqAudioObserverConfig().apply {
+            sampleRate = SAMPLE_RATE
+            channels = 1
+            mode = AoqClientEngine.AoqAudioObserverMode.AoqAudioObserverModeReadOnly
+        }
+        AoqClientEngine.AoqAudioSource.values().forEach { source ->
+            logRet("enableAudioFrameObserver($source)", eng.enableAudioFrameObserver(true, source, config))
         }
     }
 
