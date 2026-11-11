@@ -69,9 +69,24 @@ class AoqVoiceEngine(private val context: Context) {
     private val framePeak = ConcurrentHashMap<String, Int>()
 
     /** 下行播放 PCM 落盘（诊断音质用，见 [enableMicProbe]）。 */
-    private var pcmDump: RandomAccessFile? = null
+    private val pcmQueue = java.util.concurrent.ConcurrentLinkedQueue<ByteArray>()
+
+    @Volatile
+    private var pcmDumpRunning = false
+    private var pcmWriter: Thread? = null
+
+    /** 已入队字节数，用于在回调线程上廉价地挡住超限。 */
+    private var dumpQueued = 0L
+
+    @Volatile
     private var dumpBytes = 0L
-    private var dumpSampleRate = 24000
+
+    // 必须 @Volatile：这两个值由音频回调线程写、由落盘线程读去回填 WAV 头。
+    // 采样率写错会让 WAV 的音调整体偏移，把「诊断工具本身的问题」误当成「音频流的问题」。
+    @Volatile
+    private var dumpSampleRate = DECODE_SAMPLE_RATE
+
+    @Volatile
     private var dumpChannels = 1
 
     private val _events = MutableSharedFlow<AoqEvent>(extraBufferCapacity = 128)
@@ -514,41 +529,74 @@ class AoqVoiceEngine(private val context: Context) {
         logRet("enableAudioFrameObserver($source)", eng.enableAudioFrameObserver(true, source, config))
     }
 
-    /** 第一帧到达时才建文件：采样率/声道数以帧里的真实值为准，不能拿我们声明的去猜。 */
+    /**
+     * 第一帧到达时才建文件：采样率/声道数以帧里的真实值为准，不能拿我们声明的去猜。
+     *
+     * **回调线程只做 memcpy，落盘交给 [pcmWriter]**：帧回调跑在 native 实时音频线程上，
+     * 在那里同步写文件会直接制造卡顿和爆音——那样测出来的"音质糊"就分不清是流的问题
+     * 还是我这个探针的问题，诊断本身就不成立了。
+     */
     private fun appendPcmDump(pcm: ByteArray, bytes: Int, sampleRate: Int, channels: Int) {
         if (!DUMP_PLAYBACK_PCM) return
-        val raf = pcmDump ?: runCatching {
+        if (dumpQueued + bytes > DUMP_MAX_BYTES) return
+        ensurePcmWriter()
+        // 必须 copy：SDK 的缓冲区在回调返回后即失效
+        pcmQueue.offer(pcm.copyOf(bytes))
+        dumpQueued += bytes
+        dumpSampleRate = sampleRate
+        dumpChannels = channels
+    }
+
+    private fun ensurePcmWriter() {
+        if (pcmDumpRunning) return
+        pcmDumpRunning = true
+        pcmWriter = Thread {
             val dir = context.externalCacheDir ?: context.cacheDir
-            RandomAccessFile(File(dir, "aoq-playback.wav"), "rw").apply {
-                setLength(0)
-                write(ByteArray(WAV_HEADER_BYTES))
+            val file = File(dir, "aoq-playback.wav")
+            val raf = runCatching {
+                RandomAccessFile(file, "rw").apply {
+                    setLength(0)
+                    write(ByteArray(WAV_HEADER_BYTES))
+                }
+            }.getOrElse {
+                Log.w(TAG, "PCM dump 打不开：${it.message}")
+                pcmDumpRunning = false
+                return@Thread
             }
-        }.getOrElse {
-            Log.w(TAG, "PCM dump 打不开：${it.message}")
-            return
-        }
-        if (dumpBytes > DUMP_MAX_BYTES) return
-        runCatching {
-            raf.write(pcm, 0, bytes)
-            dumpBytes += bytes
-        }.onFailure {
-            Log.w(TAG, "PCM dump 写入失败，已停止：${it.message}")
-            finishPcmDump()
+            while (pcmDumpRunning || pcmQueue.isNotEmpty()) {
+                val chunk = pcmQueue.poll()
+                if (chunk == null) {
+                    runCatching { Thread.sleep(5) }
+                    continue
+                }
+                runCatching {
+                    raf.write(chunk)
+                    dumpBytes += chunk.size
+                }.onFailure {
+                    Log.w(TAG, "PCM dump 写入失败，已停止：${it.message}")
+                    pcmDumpRunning = false
+                }
+            }
+            runCatching {
+                // 回填 RIFF 头长度，让文件可以直接播放
+                raf.seek(0)
+                raf.write(wavHeader(dumpBytes, dumpSampleRate, dumpChannels))
+                raf.close()
+            }
+            Log.i(TAG, "PCM dump 已保存 ${dumpBytes}B @${dumpSampleRate}Hz/${dumpChannels}ch → ${file.absolutePath}")
+        }.apply {
+            isDaemon = true
+            priority = Thread.MIN_PRIORITY
+            start()
         }
     }
 
-    /** 回填 RIFF 头，并打出 pull 路径。 */
+    /** 停掉写线程并等它回填完 WAV 头。 */
     private fun finishPcmDump() {
-        val raf = pcmDump ?: return
-        pcmDump = null
-        val dataBytes = dumpBytes
-        runCatching {
-            raf.seek(0)
-            raf.write(wavHeader(dataBytes, dumpSampleRate, dumpChannels))
-        }
-        runCatching { raf.close() }
-        val dir = context.externalCacheDir ?: context.cacheDir
-        Log.i(TAG, "PCM dump 已保存 ${dataBytes}B → ${File(dir, "aoq-playback.wav").absolutePath}")
+        if (!pcmDumpRunning) return
+        pcmDumpRunning = false
+        runCatching { pcmWriter?.join(2000) }
+        pcmWriter = null
     }
 
     private fun wavHeader(dataBytes: Long, sampleRate: Int, channels: Int): ByteArray {
