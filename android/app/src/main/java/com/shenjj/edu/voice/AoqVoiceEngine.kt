@@ -10,6 +10,8 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
+import java.io.RandomAccessFile
 import java.util.concurrent.ConcurrentHashMap
 
 /** 引擎向 UI 抛出的事件（字幕、状态、错误）。 */
@@ -62,6 +64,16 @@ class AoqVoiceEngine(private val context: Context) {
     /** 每个 stage 独立限流，避免一个 stage 的日志挤掉其他 stage 的对照数据。 */
     private val frameLogMs = ConcurrentHashMap<String, Long>()
 
+    /** 限流窗口内的帧数与峰值：只取窗口第一帧无法区分"没帧""帧都是静音""偶发有声音"。 */
+    private val frameCount = ConcurrentHashMap<String, Int>()
+    private val framePeak = ConcurrentHashMap<String, Int>()
+
+    /** 下行播放 PCM 落盘（诊断音质用，见 [enableMicProbe]）。 */
+    private var pcmDump: RandomAccessFile? = null
+    private var dumpBytes = 0L
+    private var dumpSampleRate = 24000
+    private var dumpChannels = 1
+
     private val _events = MutableSharedFlow<AoqEvent>(extraBufferCapacity = 128)
     val events: SharedFlow<AoqEvent> = _events.asSharedFlow()
 
@@ -98,6 +110,10 @@ class AoqVoiceEngine(private val context: Context) {
         }
 
         override fun onDataMsg(msg: AoqClientEngine.AoqDataMsg) {
+            // Data 轨每条消息的字节数：如果下行音频其实是从 Data 轨以 base64 下发的
+            // （response.audio.delta），这里会看到周期性的几十 KB 大块，与字幕的小 JSON 明显可分。
+            val size = msg.data?.size ?: -1
+            if (size > DATA_CHUNK_LOG_THRESHOLD) Log.i(TAG, "dataMsg 大块 size=${size}B")
             handleData(msg.data)
         }
 
@@ -114,18 +130,32 @@ class AoqVoiceEngine(private val context: Context) {
          * 下行有没有音频只看这一个数字：audioSubscribeStats.bytes 不涨 = 服务端没发，
          * 涨了却没声音 = 本机播放/路由问题。没有它，「没声音」永远只能靠猜。
          *
-         * bitrate 的单位是 bps（实测稳态 32000，正是我们设的 [OPUS_BITRATE]），别当成 kbps。
+         * bitrate 单位是 bps（实测稳态 32000，正是我们设的 [OPUS_BITRATE]），别当成 kbps。
+         *
+         * 上下行都打印**整个数组**而不是 firstOrNull：只有一条轨时看不出差别，
+         * 但一旦 SDK 把订阅轨拆成多条（或我们订阅的 trackType 与它统计的对不上），
+         * firstOrNull 会把有流量的那条漏掉，表现成"↓sub=0 但其实有音频"。
          */
         override fun onStats(stats: AoqClientEngine.AoqStats) {
-            val pub = stats.audioPublishStats?.firstOrNull()
-            val sub = stats.audioSubscribeStats?.firstOrNull()
-            val dataSub = stats.dataMsgSubscribeStats?.firstOrNull()
             val net = stats.networkStats
+            // 逐条打印数组而不是 firstOrNull：SDK 若把订阅轨拆成多条，firstOrNull 会漏掉
+            // 真正有流量的那条，表现成"↓sub=0 但其实有音频"
+            val pub = stats.audioPublishStats?.joinToString(", ") {
+                "${it.trackType}=${it.bytes}B/${it.bitrate}bps/encVol=${it.encodeVolume}"
+            } ?: "null"
+            val sub = stats.audioSubscribeStats?.joinToString(", ") {
+                "${it.trackType}=${it.bytes}B/${it.bitrate}bps/playVol=${it.playVolume}"
+            } ?: "null"
+            val dataPub = stats.dataMsgPublishStats?.joinToString(", ") {
+                "${it.trackType}=${it.bytes}B"
+            } ?: "null"
+            val dataSub = stats.dataMsgSubscribeStats?.joinToString(", ") {
+                "${it.trackType}=${it.bytes}B"
+            } ?: "null"
             Log.i(
                 TAG,
-                "stats ↑pub=${pub?.bytes ?: -1}B/${pub?.bitrate ?: -1}kbps encVol=${pub?.encodeVolume ?: -1} " +
-                    "↓sub=${sub?.bytes ?: -1}B/${sub?.bitrate ?: -1}kbps playVol=${sub?.playVolume ?: -1} " +
-                    "data=${dataSub?.bytes ?: -1}B net recv=${net?.recvBytes ?: -1} send=${net?.sendBytes ?: -1} " +
+                "stats ↑audio=[$pub] ↓audio=[$sub] ↑data=[$dataPub] ↓data=[$dataSub] " +
+                    "net recv=${net?.recvBytes ?: -1} send=${net?.sendBytes ?: -1} " +
                     "loss=${net?.loss ?: -1} rtt=${net?.rtt ?: -1}",
             )
         }
@@ -178,9 +208,10 @@ class AoqVoiceEngine(private val context: Context) {
             return
         }
 
-        // 上下行传输都用 Opus + 16k（Stream 模式的要求，见 SAMPLE_RATE 说明）
+        // 上行 Opus + 16k（Stream 模式要求，见 SAMPLE_RATE 说明）；
+        // 下行解码按模型原生 24k 声明，见 DECODE_SAMPLE_RATE 说明。
         logRet("setAudioEncoderConfig", eng.setAudioEncoderConfig(opusCodec(SAMPLE_RATE)))
-        logRet("setAudioDecoderConfig", eng.setAudioDecoderConfig(opusCodec(SAMPLE_RATE)))
+        logRet("setAudioDecoderConfig", eng.setAudioDecoderConfig(opusCodec(DECODE_SAMPLE_RATE)))
 
         // 先起播放设备，保证下行音频一到就能出声
         val playback = AoqClientEngine.AoqAudioPlaybackConfig().apply {
@@ -209,9 +240,19 @@ class AoqVoiceEngine(private val context: Context) {
             }
             publishTracks = listOf(streamTrack(AoqClientEngine.AoqTrackType.AoqTrackTypeAudio),
                 streamTrack(AoqClientEngine.AoqTrackType.AoqTrackTypeData))
-            subscribeTracks = listOf(streamTrack(AoqClientEngine.AoqTrackType.AoqTrackTypeAudio),
-                streamTrack(AoqClientEngine.AoqTrackType.AoqTrackTypeData))
+            // 订阅侧 Audio 轨用 Segment，与 decoder 的 24kHz 配套（见 DECODE_SAMPLE_RATE：
+            // SDK 校验明确「24000 is not supported in Stream mode; use Segment mode」）。
+            // 此前是 Stream + 16kHz：上行正常，但下行包到了本机却被丢弃（↓audio 恒 0B）。
+            // Data 轨保持 Stream —— 它一直是好的（字幕/事件都正常）。
+            subscribeTracks = listOf(
+                trackParam(
+                    AoqClientEngine.AoqTrackType.AoqTrackTypeAudio,
+                    AoqClientEngine.AoqTrackMode.AoqTrackModeSegment,
+                ),
+                streamTrack(AoqClientEngine.AoqTrackType.AoqTrackTypeData),
+            )
         }
+        logNativeLibs("connect")
         val ret = eng.connect(connectConfig)
         if (ret != 0) emit(AoqEvent.Failure("connect 返回 $ret"))
     }
@@ -224,6 +265,17 @@ class AoqVoiceEngine(private val context: Context) {
         runCatching { engine?.enableSendMediaStream(AoqClientEngine.AoqTrackType.AoqTrackTypeAudio, false) }
         runCatching { engine?.disconnect() }
         runCatching { engine?.stopAudioPlayer() }
+        // 探针要在这里摘掉：帧回调在 native 线程上，destroy 之后再写文件会踩已释放的引擎。
+        // enableAudioFrameObserver 的 config 参数 SDK 声明为非空，关闭时同样要传一个。
+        runCatching {
+            engine?.enableAudioFrameObserver(
+                false,
+                AoqClientEngine.AoqAudioSource.AoqAudioSourcePlayback,
+                AoqClientEngine.AoqAudioObserverConfig(),
+            )
+        }
+        runCatching { engine?.setAudioFrameObserver(null) }
+        finishPcmDump()
         runCatching { AoqClientEngine.destroy() }
         engine = null
     }
@@ -327,6 +379,24 @@ class AoqVoiceEngine(private val context: Context) {
 
             "response.created" -> Log.i(TAG, "模型开始生成响应")
 
+            // 一轮回复由哪些内容块组成，全看这两个事件：part.type 若是 "text" 就说明服务端
+            // 压根没打算发音频（与"有字幕、无下行音频字节"完全自洽）；是 "audio" 则问题在传输/解码侧。
+            "response.output_item.added" ->
+                Log.i(TAG, "response.output_item.added item=${obj.optJSONObject("item")}")
+
+            "response.content_part.added" ->
+                Log.i(TAG, "response.content_part.added part=${obj.optJSONObject("part")}")
+
+            // 若下行音频以 base64 走 Data 轨（而不是 Audio 轨），delta 事件会带 audio 字段；
+            // 这条日志用来确认它到底有没有出现、以及音频的承载方式。
+            "response.audio.delta" ->
+                Log.i(TAG, "response.audio.delta 音频块 base64Len=${obj.optString("delta").length}")
+
+            "response.audio.done" -> {
+                Log.i(TAG, "response.audio.done 服务端声明本轮音频已生成")
+                logNativeLibs("audio.done")
+            }
+
             "response.done" -> emit(AoqEvent.ResponseDone)
 
             "error" -> {
@@ -338,8 +408,11 @@ class AoqVoiceEngine(private val context: Context) {
                 emit(AoqEvent.Failure(err?.optString("message").takeUnless { it.isNullOrEmpty() } ?: "模型返回错误"))
             }
 
-            // 未识别的事件一律打出来：事件名与 OpenAI 有差异时，静默丢弃会表现成"一切正常但界面空白"
-            else -> Log.i(TAG, "未处理的事件 $type")
+            // 未识别的事件一律打出来（带原文）：事件名与 OpenAI 有差异时，静默丢弃会表现成"一切正常但界面空白"
+            else -> Log.i(
+                TAG,
+                "未处理的事件 $type raw=${obj.toString().take(400)}",
+            )
         }
     }
 
@@ -347,6 +420,13 @@ class AoqVoiceEngine(private val context: Context) {
         // dataPtr 是平台类型：声明为非空 ByteArray，靠 elvis 提前返回保证安全
         val pcm: ByteArray = frame.dataPtr ?: return
         val bytes = minOf(frame.dataSize, pcm.size)
+        // 落盘必须在下面的限流 return **之前**：限流是 1 秒只放一帧进日志，
+        // 若放在后面就只录到 1/100 的音频，WAV 会变成断续 noise，反而误导音质判断。
+        if (stage == "playback") {
+            frame.samplesPerSec.takeIf { it > 0 }?.let { dumpSampleRate = it }
+            frame.numOfChannels.takeIf { it > 0 }?.let { dumpChannels = it }
+            appendPcmDump(pcm, bytes, dumpSampleRate, dumpChannels)
+        }
         var peak = 0
         var i = 0
         while (i + 1 < bytes) {
@@ -358,26 +438,129 @@ class AoqVoiceEngine(private val context: Context) {
         // 逐 stage 限流：共用一个时间戳会让后面的 stage 全被第一个吞掉，就失去对照意义了
         val now = System.currentTimeMillis()
         val last = frameLogMs[stage] ?: 0L
-        if (now - last < 1000) return
+        if (now - last < 1000) {
+            frameCount[stage] = (frameCount[stage] ?: 0) + 1
+            framePeak[stage] = maxOf(framePeak[stage] ?: 0, peak)
+            return
+        }
+        val count = frameCount[stage] ?: 0
+        val maxPeak = maxOf(framePeak[stage] ?: 0, peak)
         frameLogMs[stage] = now
-        Log.i(TAG, "mic[$stage] sr=${frame.samplesPerSec} ch=${frame.numOfChannels} bytes=$bytes peak=$peak")
+        frameCount[stage] = 1
+        framePeak[stage] = 0
+        // frames 与 peakMax 都不可省：只报峰值会分不清「完全没有帧」(frames=0)
+        // 和「有帧但全是静音」(frames≈100, peakMax≈0)，这两者的根因完全不同。
+        // autoGenMute=true 表示这一帧是 SDK 自己补的静音占位，不是远端真实音频。
+        Log.i(
+            TAG,
+            "mic[$stage] frames=$count peakMax=$maxPeak autoGenMute=${frame.autoGenMute} " +
+                "sr=${frame.samplesPerSec} ch=${frame.numOfChannels} bytes=$bytes",
+        )
     }
 
     /**
-     * 打开采集/播放链路各点的 PCM 探针（ReadOnly，不改动音频），**仅 debug 构建**。
-     * `enableAudioFrameObserver` 一次只接受一个数据源，所以逐点开启。
+     * 打印进程里**真正加载**的 AOQ 相关 native 库，以及 Opus 插件文件在不在磁盘上。
+     *
+     * 为什么这是本轮最关键的一条：下行音频是 Opus，而 AOQ 的 Opus 编解码走的是**外挂插件**
+     * `libPluginOpus.so`。此前查 `/proc/<pid>/maps` 只见 `libaoq_client_sdk.so` 与
+     * `libaoqffmpeg_rd.so`，插件没被 dlopen。若确实如此，表现恰好就是现在这样：
+     * 包到了网卡（`net recv` 在 AI 说话时暴涨）却解不出音频（`↓audio=0`、playback 全静音），
+     * 而字幕走 Data 轨的 JSON，完全不受影响——正好对上「有字幕、没声音」。
+     *
+     * 磁盘上存在但 maps 里没有 = 加载路径/初始化问题；磁盘上根本没有 = 打包或 ABI 问题。
+     */
+    private fun logNativeLibs(stage: String) {
+        if (!BuildConfig.DEBUG) return
+        val pattern = Regex("aoq|opus|plugin|webrtc|ffmpeg", RegexOption.IGNORE_CASE)
+        // 必须 readText 一次性读完：用 bufferedReader/useLines 时惰性序列在流关闭后才求值，
+        // 上一版就是因此打出 "Stream closed"，整条证据白拿。
+        val loaded = runCatching {
+            File("/proc/self/maps").readText().lineSequence()
+                .mapNotNull { it.trim().substringAfterLast(' ').takeIf { p -> p.endsWith(".so") } }
+                .map { it.substringAfterLast('/') }
+                .filter { pattern.containsMatchIn(it) }
+                .distinct()
+                .sorted()
+        }.getOrElse { listOf("<maps 读取失败: ${it.message}>") }
+        val dir = runCatching { context.applicationInfo.nativeLibraryDir }.getOrNull()
+        val plugin = dir?.let { File(it, "libPluginOpus.so") }
+        Log.i(
+            TAG,
+            "native[$stage] loaded=$loaded | pluginPath=${plugin?.absolutePath} " +
+                "exists=${plugin?.exists()} size=${plugin?.length()}",
+        )
+    }
+
+    /**
+     * 打开下行播放 PCM 探针（ReadOnly，不改动音频），并落盘成 WAV，**仅 debug 构建**。
+     *
+     * 用途是切开「AI 的语音本身糊」与「模拟器输出糊」这两种音质问题：探针拿到的字节是
+     * **解码之后、送 AudioTrack 之前**的数据，把它拿到 PC 上听——
+     * 清楚 = 流和解码都没问题，糊是模拟器/播放配置造成的；糊 = 问题在更上游。
+     *
+     * 只注册 Playback 一个数据源：帧回调运行在实时音频线程上，之前四个源一起开
+     * （captured/3A/publish/playback）本身就可能挤占线程造成断续，先把它降到最小。
+     * 把 [DUMP_PLAYBACK_PCM] 置 false 可彻底关掉探针，用来做「有没有探针」的 A/B 对比。
      */
     private fun enableMicProbe(eng: AoqClientEngine) {
-        if (!BuildConfig.DEBUG) return
+        if (!BuildConfig.DEBUG || !DUMP_PLAYBACK_PCM) return
         logRet("setAudioFrameObserver", eng.setAudioFrameObserver(frameListener))
         val config = AoqClientEngine.AoqAudioObserverConfig().apply {
-            sampleRate = SAMPLE_RATE
+            sampleRate = DECODE_SAMPLE_RATE
             channels = 1
             mode = AoqClientEngine.AoqAudioObserverMode.AoqAudioObserverModeReadOnly
         }
-        AoqClientEngine.AoqAudioSource.values().forEach { source ->
-            logRet("enableAudioFrameObserver($source)", eng.enableAudioFrameObserver(true, source, config))
+        val source = AoqClientEngine.AoqAudioSource.AoqAudioSourcePlayback
+        logRet("enableAudioFrameObserver($source)", eng.enableAudioFrameObserver(true, source, config))
+    }
+
+    /** 第一帧到达时才建文件：采样率/声道数以帧里的真实值为准，不能拿我们声明的去猜。 */
+    private fun appendPcmDump(pcm: ByteArray, bytes: Int, sampleRate: Int, channels: Int) {
+        if (!DUMP_PLAYBACK_PCM) return
+        val raf = pcmDump ?: runCatching {
+            val dir = context.externalCacheDir ?: context.cacheDir
+            RandomAccessFile(File(dir, "aoq-playback.wav"), "rw").apply {
+                setLength(0)
+                write(ByteArray(WAV_HEADER_BYTES))
+            }
+        }.getOrElse {
+            Log.w(TAG, "PCM dump 打不开：${it.message}")
+            return
         }
+        if (dumpBytes > DUMP_MAX_BYTES) return
+        runCatching {
+            raf.write(pcm, 0, bytes)
+            dumpBytes += bytes
+        }.onFailure {
+            Log.w(TAG, "PCM dump 写入失败，已停止：${it.message}")
+            finishPcmDump()
+        }
+    }
+
+    /** 回填 RIFF 头，并打出 pull 路径。 */
+    private fun finishPcmDump() {
+        val raf = pcmDump ?: return
+        pcmDump = null
+        val dataBytes = dumpBytes
+        runCatching {
+            raf.seek(0)
+            raf.write(wavHeader(dataBytes, dumpSampleRate, dumpChannels))
+        }
+        runCatching { raf.close() }
+        val dir = context.externalCacheDir ?: context.cacheDir
+        Log.i(TAG, "PCM dump 已保存 ${dataBytes}B → ${File(dir, "aoq-playback.wav").absolutePath}")
+    }
+
+    private fun wavHeader(dataBytes: Long, sampleRate: Int, channels: Int): ByteArray {
+        val byteRate = sampleRate * channels * 2
+        val out = java.nio.ByteBuffer.allocate(WAV_HEADER_BYTES).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+        out.put("RIFF".toByteArray()).putInt((dataBytes + 36).toInt())
+        out.put("WAVE".toByteArray())
+        out.put("fmt ".toByteArray()).putInt(16).putShort(1) // PCM
+        out.putShort(channels.toShort()).putInt(sampleRate)
+        out.putInt(byteRate).putShort((channels * 2).toShort()).putShort(16)
+        out.put("data".toByteArray()).putInt(dataBytes.toInt())
+        return out.array()
     }
 
     private fun sendRaw(json: String) {
@@ -394,10 +577,15 @@ class AoqVoiceEngine(private val context: Context) {
     }
 
     private fun streamTrack(type: AoqClientEngine.AoqTrackType) =
-        AoqClientEngine.AoqTrackParam().apply {
-            trackType = type
-            trackMode = AoqClientEngine.AoqTrackMode.AoqTrackModeStream
-        }
+        trackParam(type, AoqClientEngine.AoqTrackMode.AoqTrackModeStream)
+
+    private fun trackParam(
+        type: AoqClientEngine.AoqTrackType,
+        mode: AoqClientEngine.AoqTrackMode,
+    ) = AoqClientEngine.AoqTrackParam().apply {
+        trackType = type
+        trackMode = mode
+    }
 
     private fun emit(event: AoqEvent) {
         _events.tryEmit(event)
@@ -448,6 +636,39 @@ class AoqVoiceEngine(private val context: Context) {
          */
         private const val SAMPLE_RATE = 16000
 
+        /**
+         * 下行解码采样率 = **24000**，与上行不同，依据两条：
+         *
+         * 1. 模型侧 `output_audio_format=pcm` 文档写明是 **24kHz** 16bit 单声道，
+         *    网关大概率按原生 24k 下发音频。
+         * 2. SDK 的 connect 校验报错原文给了合法组合：
+         *    `subscribe audio sampleRate 24000 is not supported in Stream mode;
+         *     use Segment mode or change decoder sampleRate`
+         *    —— 即 **24000 必须配 Segment 订阅轨**，两者是绑定的，见 [subscribeTracks]。
+         *
+         * 此前按后半句把 decoder 改成 16000 并保留 Stream：上行因此正常（ASR/VAD 都对），
+         * 但下行 `↓audio` 恒为 0B，而抓包量显示音频包确实到了本机 → 声明与实发不符被丢弃。
+         * 注意上行 [SAMPLE_RATE] 仍是 16000，**不要一起改**，那是 Stream 上行的硬性要求。
+         */
+        private const val DECODE_SAMPLE_RATE = 24000
+
         private const val OPUS_BITRATE = 32000
+
+        /**
+         * Data 轨单条消息超过此字节数就单独记一行：字幕 JSON 只有几百 B，
+         * 而音频块会是几十 KB，两者据此可分。
+         */
+        private const val DATA_CHUNK_LOG_THRESHOLD = 4096
+
+        /**
+         * 是否把下行播放 PCM 落盘成 WAV（诊断音质，见 [enableMicProbe]）。
+         * 置 false 会连帧探针一起关掉，可直接做「开/关探针」的 A/B 对比。
+         */
+        private const val DUMP_PLAYBACK_PCM = true
+
+        private const val WAV_HEADER_BYTES = 44
+
+        /** 上限 60s @24kHz 单声道 16bit ≈ 2.7MB，防止忘了关就一直写。 */
+        private const val DUMP_MAX_BYTES = 2_880_000L
     }
 }
