@@ -257,6 +257,11 @@ class AoqVoiceEngine(private val context: Context) {
         }
         val type = obj.optString("type")
         when (type) {
+            // 服务端建连后的首个事件，携带它**真正生效**的默认配置。
+            // 打出来才能确认我们的 session.update 到底被采纳了什么（voice / turn_detection / model）。
+            "session.created" ->
+                Log.i(TAG, "session.created session=${obj.optJSONObject("session")}")
+
             "session.updated" -> {
                 val eng = engine ?: return
                 // 握手完成：开上行 + 起麦克风采集（VAD 需要持续上行才有轮次）
