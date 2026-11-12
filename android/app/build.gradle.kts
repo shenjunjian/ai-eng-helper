@@ -45,7 +45,10 @@ android {
         release {
             optimization {
                 enable = true
-                packageScope = setOf("androidx.**", "kotlin.**", "kotlinx.**")
+                // 不要设置 packageScope：部分优化（gradual shrinking）只会重命名被圈定的包，
+                // 但它把 kotlin.** 重命名成了无包名的扁平类（如 f91），而 f91 继承的父类
+                // kotlin.sequences.d 未被重命名、是包内可见的 → 运行期 IllegalAccessError，
+                // 应用启动即闪退。必须让 R8 一次性处理全部包，可见性才自洽。
             }
         }
     }
