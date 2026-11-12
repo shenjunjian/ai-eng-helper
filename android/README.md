@@ -22,7 +22,7 @@ JAVA_HOME="d:/AndroidStudio2026/jbr" ./gradlew.bat :app:assembleDebug --console=
 ```
 
 产物：`app/build/outputs/apk/debug/app-debug.apk`。
-装到真机（语音对话需要麦克风，模拟器不方便测）：
+安装到真机或支持 ARM 应用的模拟器：
 
 ```bash
 JAVA_HOME="d:/AndroidStudio2026/jbr" ./gradlew.bat :app:installDebug
@@ -41,6 +41,8 @@ AOQ_API_KEY=你的百炼APIKey
 AOQ_WORKSPACE_ID=llm-4xy851f7r9core2a
 AOQ_REGION=cn-beijing
 AOQ_MODEL=qwen-audio-3.1-realtime-flash
+# 可选：采集与播放统一做 A/B，默认 true；不要只改其中一处。
+AOQ_USE_VOIP_MODE=true
 ```
 
 `AOQ_REGION` 与 `AOQ_MODEL` 有默认值，可省略。取凭证的端点由 WorkspaceId 拼出：
@@ -121,6 +123,27 @@ app/src/main/java/com/shenjj/edu/
 │   └── theme/            Color/Type/Shape/Theme（对齐原型 token，已关 dynamicColor）
 └── voice/                AOQ：TokenClient、VoiceEngine、CallViewModel、标题总结、前台服务
 ```
+
+## 语音回归与 `isVoipMode` A/B
+
+常规版本不注册 PCM 帧探针，也不写 `aoq-playback.wav`。保留 `AoqVoice` 下的
+session 关键配置回显、上下行音频字节/音量、VAD、设备错误与路由日志。
+
+1. 先在模拟器 **Extended Controls → Microphone** 启用宿主麦克风，或启动时加 `-audio winin`。
+   同时授予 App 录音权限，并确认安装包已更新：
+   `adb shell dumpsys package com.shenjj.edu | grep lastUpdateTime`。
+2. 保持 `AOQ_USE_VOIP_MODE=true`，重新构建、安装并彻底重启 App。先验证“仅清理诊断代码”：
+   能连接并收到 `session.updated`、讲话有 VAD 与字幕、AI 有语音回复、挂断后可再次通话。
+3. 需要对照时改为 `AOQ_USE_VOIP_MODE=false`，重新构建安装。该值同时作用于采集和播放，
+   通过日志 `audio config voip=...` 确认测试的是新配置；不要只改其中一处。
+4. 观察 `audio stats`：讲话时 `↑` 字节持续增长，AI 回复时 `↓` 字节和 `playVol` 增长。
+   `encVol`/`playVol` 是辅助指标，不是 PCM 峰值。`RecordFail`/`PlayFail` 或启动返回非 0
+   应显示错误，不能只看界面“对话中”。
+
+`isVoipMode` 在 SDK 中默认是 `false`，会传入 native 音频实现。当前保留 `true` 是为了
+通话音频处理与回声抑制；关闭可能改变音量通道、音频路由以及 AEC/降噪效果。AAR 没有
+公开完整映射，不能把模拟器听感当作这些系统行为的证明。模拟器仅回归连接、VAD、字幕
+与链路日志；外放回声、音质、延迟和蓝牙耳机路由必须在真机上复核。
 
 ## 排错
 

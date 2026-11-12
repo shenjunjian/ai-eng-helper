@@ -47,7 +47,9 @@ AOQ 的事件协议是 **fun-audiochat**，与 OpenAI Realtime **字段名和取
    销毁顺序：`stopAudioCapture` → `enableSendMediaStream(false)` → `disconnect` → `stopAudioPlayer` → `destroy`
 5. **事件时序**（顺序错就白干）：
    `AoqConnectionStatusConnected` → 发 `session.update` → 收 `session.created` → 收 `session.updated`
-   → `enableSendMediaStream(Audio, true)` → `startAudioCapture` → 打开音频帧探针
+   → `enableSendMediaStream(Audio, true)` → `startAudioCapture`
+
+   常规版本**不**注册音频帧探针；只在专项排障时临时启用，定位后移除（见「诊断方法」）。
 
 > `createEngine` 在 native 库加载失败时返回 **null**（不抛异常），声明成可空并显式判空。
 
@@ -99,7 +101,7 @@ subscribeTracks = listOf(
 ## 模拟器环境坑（先排除这些，再怀疑代码）
 
 - **麦克风默认不进 guest**：必须 **Extended Controls → microphone → 勾选**，
-  否则宿主麦克风根本不进系统。表现是 `mic[captured] peak` 只有 3~9（≈ −71dBFS 死噪）、VAD 永不触发。
+  否则宿主麦克风根本不进系统。表现是 `mic[captured] peak` 只有 3~9（≈ −71dBFS 死噪，需临时开帧探针才看得到）、VAD 永不触发。
   也可用 `-audio winin` 启动模拟器。**这是"没反应"的第一嫌疑，成本最低，先查它。**
 - Windows 侧可查注册表 `HKCU\...\CapabilityAccessManager\ConsentStore\microphone\NonPackaged`
   看有没有 emulator/qemu 的条目。
@@ -109,9 +111,11 @@ subscribeTracks = listOf(
 
 ## 诊断方法（本次真正定论的手段）
 
+**以下 3~5 依赖帧探针 / WAV dump / `net recv`，常规版本都不包含，排障时需临时加回。**
+
 按"最快定论"排序：
 
-1. **`onStats` 里 `net recv` 增量 vs `↓data` 增量对比** —— 一刀切开
+1. **`onStats` 里 `net recv` 增量 vs `↓data` 增量对比**（排障版才含这两个字段）—— 一刀切开
    "服务端没发音频" 和 "发了但本机没处理"。差值就是 Audio 轨收到的字节。
    本次：AI 说话 2s 内 `net recv` +52KB 而 `↓data` 只 +9.4KB → 43KB 是音频包，已到本机。
 2. **`onStats` 用 `joinToString` 打整个数组**，不要 `firstOrNull()`：SDK 可能拆成多条订阅轨，
@@ -144,20 +148,26 @@ subscribeTracks = listOf(
 
 ## 验证清单（按顺序，每步都能否证一个假设）
 
+常规版本按以下顺序检查：
+
+1. `↑audio` 字节持续增长、`encVol` > 0 → 上行推流正常（否则先查模拟器麦克风和权限）
+2. `input_audio_buffer.speech_started` / `speech_stopped` → 服务端 VAD 在收
+3. `session.updated` 回显与预期一致 → 参数真的被接受
+4. `response content type=audio` → 服务端声明了音频（不是只回文本）
+5. `↓audio` 字节 > 0 且 `playVol` > 0 → SDK 收下并解码了
+
+若仍不能定位，再按「诊断方法」临时加入探针，补充检查：
+
 1. `mic[captured] peak` > 1000 → 模拟器麦克风通了（否则先查 Extended Controls）
-2. `↑audio` 字节持续增长、`encVol` > 0 → 上行推流正常
-3. `input_audio_buffer.speech_started` / `speech_stopped` → 服务端 VAD 在收
-4. `session.updated` 回显与预期一致 → 参数真的被接受
-5. `response.content_part.added part={"type":"audio"}` → 服务端声明了音频（不是只回文本）
-6. `net recv` 增量 ≫ `↓data` 增量 → 音频包到了本机
-7. `↓audio` 字节 > 0 且 `playVol` > 0 → SDK 收下并解码了
-8. `mic[playback] peakMax` 跳起来 → PCM 进了播放管线
-9. WAV dump 在 PC 上清晰 → 流与解码都好，剩下的问题在设备/虚拟机输出链
+2. `net recv` 增量 ≫ `↓data` 增量 → 音频包到了本机
+3. `mic[playback] peakMax` 跳起来 → PCM 进了播放管线
+4. WAV dump 在 PC 上清晰 → 流与解码都好，剩下的问题在设备/虚拟机输出链
 
 ## 收尾待办
 
-- `DUMP_PLAYBACK_PCM` 目前为 `true`（debug-only）。真机验证通过后置 `false` 或整体摘除：
-  它会往外部缓存写最多约 2.7MB WAV，并在音频线程上挂帧回调。
+- **音频帧探针与 WAV 落盘已从常规版本移除**（曾会写外部缓存 + 在音频线程挂回调，影响音质与存储）。
+  排障时按需临时加回，用完删掉。
 - 音频焦点/路由尚未处理：`isDefaultSpeaker = true` 是硬编码，没有 `AudioManager` / `AudioFocus` 管理，
-  耳机与听筒切换未验证。`isVoipMode = true` 是**故意保留**的——需要 AEC，否则 AI 的声音会被麦克风拾回形成循环。
+  耳机与听筒切换未验证。`isVoipMode` 现由 `BuildConfig.AOQ_USE_VOIP_MODE`（`local.properties`，默认 `true`）
+  控制，**同时作用于采集与播放**，方便 A/B；保留 `true` 是为了 AEC，否则 AI 的声音会被麦克风拾回形成循环。
 - 音质、延迟、蓝牙路由结论都必须真机复核，模拟器不作数。

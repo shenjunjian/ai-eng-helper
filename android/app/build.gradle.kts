@@ -39,6 +39,8 @@ android {
         buildConfigField("String", "AOQ_WORKSPACE_ID", "\"${localProp("AOQ_WORKSPACE_ID")}\"")
         buildConfigField("String", "AOQ_REGION", "\"${localProp("AOQ_REGION", "cn-beijing")}\"")
         buildConfigField("String", "AOQ_MODEL", "\"${localProp("AOQ_MODEL", "qwen-audio-3.1-realtime-flash")}\"")
+        // 仅用于音频路由/AEC 的 A/B 回归；默认保持当前已验证行为。
+        buildConfigField("boolean", "AOQ_USE_VOIP_MODE", localProp("AOQ_USE_VOIP_MODE", "true").toBoolean().toString())
     }
 
     buildTypes {
